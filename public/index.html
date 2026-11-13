@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NYC Pulse · L train</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0b0d12; color: #e8eaf0; font: 13px/1.5 system-ui, sans-serif; overflow: hidden; }
+  canvas { display: block; width: 100%; height: 100%; }
+  #hud { position: fixed; left: 14px; top: 12px; pointer-events: none; text-shadow: 0 1px 4px #000; }
+  #hud b { font-size: 15px; }
+  .n { color: #6ee7ff; } .s { color: #ffb86b; } .m { color: #8a90a0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"></div>
+<script>
+const SPEED = 10;          // assumed running speed, m/s, used to place trains between stops
+const COLORS = { N: '#6ee7ff', S: '#ffb86b' };
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const hud = document.getElementById('hud');
+
+let line, W, H, sc = {}, stopPx = [], hover = null;
+let trains = new Map(); // id -> { d: train data, shown: distance along line }
+let status = 'connecting', updatedAt = null, offset = 0, retry = 0;
+
+// ---------- layout ----------
+function layout() {
+  const dpr = devicePixelRatio || 1;
+  W = innerWidth; H = innerHeight;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+  const all = Object.values(line.shapes).flatMap((s) => s.coords);
+  const lons = all.map((p) => p[0]), lats = all.map((p) => p[1]);
+  const lon0 = (Math.min(...lons) + Math.max(...lons)) / 2;
+  const lat0 = (Math.min(...lats) + Math.max(...lats)) / 2;
+  const k = Math.cos((lat0 * Math.PI) / 180);
+  const dx = (Math.max(...lons) - Math.min(...lons)) * k;
+  const dy = Math.max(...lats) - Math.min(...lats);
+  const s = Math.min((W - 140) / dx, (H - 140) / dy);
+  const P = (lon, lat) => [W / 2 + (lon - lon0) * k * s, H / 2 - (lat - lat0) * s];
+
+  for (const dir in line.shapes) sc[dir] = line.shapes[dir].coords.map(([lo, la]) => P(lo, la));
+  const first = Object.keys(line.shapes)[0];
+  stopPx = Object.entries(line.stops).filter(([, v]) => v.dir === first).map(([id, v]) => ({ id, name: v.name, p: P(v.lon, v.lat) }));
+}
+
+// Point at distance d along a direction's shape, nudged sideways so N and S trains ride separate tracks.
+function pointAt(dir, d, off) {
+  const { cum } = line.shapes[dir], pts = sc[dir];
+  d = clamp(d, 0, cum[cum.length - 1]);
+  let lo = 0, hi = cum.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (cum[m] <= d) lo = m; else hi = m; }
+  const t = (d - cum[lo]) / (cum[hi] - cum[lo] || 1);
+  const [x0, y0] = pts[lo], [x1, y1] = pts[hi];
+  const L = Math.hypot(x1 - x0, y1 - y0) || 1;
+  const tx = (x1 - x0) / L, ty = (y1 - y0) / L;
+  return [x0 + (x1 - x0) * t - ty * off, y0 + (y1 - y0) * t + tx * off];
+}
+
+// ---------- where is this train right now? ----------
+function targetDist(t, now) {
+  const order = line.order[t.dir];
+  const idx = order?.indexOf(t.nextStop.stopId);
+  if (idx == null || idx < 0) return null;
+  const dNext = line.stops[t.nextStop.stopId].dist;
+  if (!t.hasVehicle) return { d: dNext, state: 'scheduled' };
+
+  const dPrev = idx > 0 ? line.stops[order[idx - 1]].dist : dNext;
+  const eta = Math.max(0, t.nextStop.t - now);
+  const est = clamp(dNext - SPEED * eta, dPrev, dNext);
+
+  if (t.vehicleStatus === 1 && t.vehicleStop) {
+    const at = line.stops[t.vehicleStop];
+    if (at) {
+      if (t.vehicleStop === t.nextStop.stopId) return { d: dNext, state: 'stopped' };
+      // dwelling at an earlier stop: hold there until the ETA says it should be underway
+      return est > at.dist ? { d: est, state: 'moving' } : { d: at.dist, state: 'stopped' };
+    }
+  }
+  return { d: est, state: 'moving' };
+}
+
+// ---------- data ----------
+function apply(m) {
+  if (m.serverNow) offset = m.serverNow - Date.now();
+  updatedAt = m.updatedAt;
+  if (m.type === 'snapshot') {
+    const next = new Map();
+    for (const d of m.trains) next.set(d.id, { d, shown: trains.get(d.id)?.shown });
+    trains = next;
+  } else {
+    for (const id of m.remove) trains.delete(id);
+    for (const d of m.upsert) trains.set(d.id, { d, shown: trains.get(d.id)?.shown });
+  }
+}
+
+function connect() {
+  const ws = new WebSocket(`${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}`);
+  ws.onopen = () => { status = 'live'; retry = 0; };
+  ws.onmessage = (e) => apply(JSON.parse(e.data));
+  ws.onclose = () => { status = 'reconnecting'; setTimeout(connect, Math.min(1000 * 2 ** retry++, 15000)); };
+}
+
+// ---------- draw ----------
+let last = performance.now();
+function frame(ts) {
+  const dt = Math.min(0.1, (ts - last) / 1000); last = ts;
+  const now = (Date.now() + offset) / 1000;
+  ctx.clearRect(0, 0, W, H);
+
+  // track
+  const dirs = Object.keys(sc);
+  ctx.lineCap = ctx.lineJoin = 'round';
+  ctx.beginPath();
+  sc[dirs[0]].forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+  ctx.strokeStyle = line.color + '40'; ctx.lineWidth = 16; ctx.stroke();
+  ctx.strokeStyle = line.color + 'a0'; ctx.lineWidth = 2; ctx.stroke();
+
+  // stops
+  for (const s of stopPx) {
+    ctx.beginPath(); ctx.arc(s.p[0], s.p[1], 3.5, 0, 7);
+    ctx.fillStyle = '#0b0d12'; ctx.fill();
+    ctx.strokeStyle = line.color; ctx.lineWidth = 1.5; ctx.stroke();
+  }
+
+  // trains
+  let running = 0, scheduled = 0;
+  for (const tr of trains.values()) {
+    const tgt = targetDist(tr.d, now);
+    if (!tgt) continue;
+    tr.shown = tr.shown == null ? tgt.d : tr.shown + (tgt.d - tr.shown) * (1 - Math.exp(-dt * 3)); // ease toward fresh estimates
+    const [x, y] = pointAt(tr.d.dir, tr.shown, 6);
+    const c = COLORS[tr.d.dir] ?? '#fff';
+    if (tgt.state === 'scheduled') {
+      scheduled++;
+      ctx.globalAlpha = 0.25; ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(x, y, 3, 0, 7); ctx.fill(); ctx.globalAlpha = 1;
+      continue;
+    }
+    running++;
+    ctx.shadowColor = c; ctx.shadowBlur = 14; ctx.fillStyle = c;
+    ctx.beginPath(); ctx.arc(x, y, 5, 0, 7); ctx.fill();
+    ctx.shadowBlur = 0;
+    if (tgt.state === 'stopped') {
+      ctx.strokeStyle = c; ctx.globalAlpha = 0.5 + 0.5 * Math.sin(ts / 250); ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.arc(x, y, 9, 0, 7); ctx.stroke(); ctx.globalAlpha = 1;
+    }
+  }
+
+  // hovered stop name
+  if (hover) {
+    ctx.font = '12px system-ui'; ctx.fillStyle = '#e8eaf0';
+    ctx.fillText(hover.name, hover.p[0] + 10, hover.p[1] - 10);
+  }
+
+  const age = updatedAt ? Math.round((Date.now() + offset - updatedAt) / 1000) : null;
+  const stale = age != null && age > 90;
+  const name = (dir) => line.stops[line.order[dir]?.at(-1)]?.name ?? dir;
+  hud.innerHTML =
+    `<b>NYC Pulse · ${line.line} train</b><br>` +
+    `<span class="${stale ? 's' : 'm'}">${stale ? 'stale' : status}${age != null ? ` · data ${age}s old` : ''}</span><br>` +
+    `${running} running · ${scheduled} scheduled<br>` +
+    dirs.map((d) => `<span class="${d === 'N' ? 'n' : 's'}">●</span> ${d} to ${name(d)}`).join('<br>');
+
+  requestAnimationFrame(frame);
+}
+
+addEventListener('resize', () => line && layout());
+addEventListener('pointermove', (e) => {
+  hover = stopPx.find((s) => Math.hypot(s.p[0] - e.clientX, s.p[1] - e.clientY) < 14) ?? null;
+});
+
+(async () => {
+  line = await (await fetch('/data/l-line.json')).json();
+  layout(); connect(); requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>

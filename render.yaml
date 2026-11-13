@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: nyc-pulse
+    runtime: node
+    # "free" sleeps after ~15 min without traffic, so the server stops polling and the first visitor waits.
+    # Switch to "starter" before sharing the link so it stays awake.
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
